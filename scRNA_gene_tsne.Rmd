@@ -1,0 +1,330 @@
+---
+title: "scRNA_gene_tsne"
+author: "Joe Boyd"
+date: "5/4/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Objective
+
+Cluster a subset of genes into modules based on patterns of expression in single cells. 
+Then analyze expression patterns of identified gene modules.
+
+
+```{r libs}
+library(Seurat)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+```
+
+```{r functions}
+
+#' get_meta_dt
+#'
+#' @param seurat_obj an object of class Seurat to extract meta data from
+#' @param to_combine 
+#' @param cluster_vars cluster variables, will be made factors with levels ordered by decreasing size.
+#' @param manual_factors named list, names specify variables and entries specify factor levels to apply.
+#' @param reduction string to specify reduction, must be in seurat_obj@reductions
+#'
+#' @return
+#' @export
+#'
+#' @examples
+get_meta_dt = function(seurat_obj, 
+                       combine_source = "seurat_clusters",
+                       to_combine = get_clusters_to_combine(),
+                       cluster_vars = c("seurat_clusters", "meta_cluster"),
+                       manual_factors = list(orig.ident = c("wt", "df4")),
+                       reduction = "umap"){
+    meta_dt = as.data.table(seurat_obj@meta.data)
+    meta_dt$id = seurat_obj@meta.data %>% rownames
+    
+    if(reduction %in% names(seurat_obj@reductions)){
+        stopifnot(reduction %in% names(seurat_obj@reductions))
+        umap_dt = as.data.table(seurat_obj@reductions[[reduction]]@cell.embeddings, keep.rownames = TRUE) %>% setnames(., "rn", "id")
+        meta_dt = merge(meta_dt, umap_dt, by = "id")    
+    }else{
+        meta_dt$UMAP_1 = NA
+        meta_dt$UMAP_2 = NA
+    }
+    
+    if(!is.null(to_combine)){
+        to_combine_dt = lapply(to_combine, function(x){
+            data.table(indi_clust = factor(x, levels = levels(meta_dt[[combine_source]])))
+        }) %>% rbindlist(idcol = "meta_cluster")
+        setnames(to_combine_dt, "indi_clust", combine_source)
+        meta_dt = merge(meta_dt, to_combine_dt, by = combine_source, allow.cartesian = TRUE) %>% unique    
+    }
+    
+    for(i in seq_along(manual_factors)){
+        meta_dt[[names(manual_factors)[i]]] = factor(meta_dt[[names(manual_factors)[i]]], levels = manual_factors[[i]])    
+    }
+    
+    
+    stopifnot(cluster_vars %in% colnames(meta_dt))
+    for(cv in cluster_vars){
+        lev = meta_dt[, .N, c(cv)][order(N, decreasing = TRUE)][[cv]] %>% as.character
+        meta_dt[[cv]] = factor(meta_dt[[cv]], levels = lev)
+    }
+    
+    meta_dt$meta_cluster = factor(meta_dt$meta_cluster, levels = get_cluster_rename())
+    
+    meta_dt
+}
+
+#use this if no clustering information exists for seurat_obj
+get_meta_dt.raw = function(seurat_obj){
+    get_meta_dt(seurat_obj, to_combine = NULL, cluster_vars = character())    
+}
+
+
+get_clusters_to_combine = function(){
+    all_clust = 0:16
+    main_group = c(0,1,2,3,5,16)
+    other_groups = as.list(setdiff(all_clust, main_group))
+    names(other_groups) = setdiff(all_clust, main_group)
+    to_comb = c(list(main = main_group), other_groups)
+    
+    names(to_comb)
+    names(to_comb) = get_cluster_rename()[names(to_comb)]
+    to_comb
+}
+
+
+get_cluster_rename = function(){
+
+    rename_clust = c("main" = "1", 
+                     "10" = "2", 
+                     "11" = "3", 
+                     "7" = "4", 
+                     "4" = "5", 
+                     "13" = "6", 
+                     "6"= "7", 
+                     "15" = "8",
+                     "12" = "9", 
+                     "9" = "10", 
+                     "8" = "11", 
+                     "14" = "12"
+    )
+    rename_clust
+}
+
+
+get_rna_dt = function(seurat_obj, sel_genes = NULL, raw_counts = FALSE, assay_name = "RNA"){
+    if(is.null(sel_genes)){
+        rna_dt = as.data.frame(seurat_obj@assays[[assay_name]]@counts)
+    }else{
+        len_input = length(sel_genes)
+        sel_genes = intersect(sel_genes, seurat_obj@assays[[assay_name]] %>% rownames)
+        if(length(sel_genes) != len_input){
+            d = len_input - length(sel_genes)
+            perc = round(100 * d / len_input, 2)
+            warning(perc, "% (", d, " of ", len_input, ") genes discarded to match scRNAseq")
+        }
+        if(!raw_counts){
+            rna_dt = as.data.frame(seurat_obj@assays[[assay_name]][sel_genes, ])    
+        }else{
+            rna_dt = as.data.frame(seurat_obj@assays[[assay_name]]@counts[sel_genes, ])    
+        }
+        
+        
+    }
+    rna_dt$gene_name = rownames(rna_dt)
+    rna_dt = melt(as.data.table(rna_dt), variable.name = "id", value.name = "expression", id.vars = "gene_name")
+    rna_dt
+}
+
+```
+
+These are the inputs
+
+* pbmc - a Seurat object
+* de_dt - a data.table of DESeq results, expected to have gene_name, baseMean, and log2FoldChange columns.
+
+Example data paths are relative to /slipstream/home/joeboyd/
+```{r data}
+pbmc = readRDS("../SF_AutoImmune_ssv/Bcell_combined.refixed_120919.rds")
+de_dt = fread("ex_de_res.csv")
+goi = de_dt$gene_name
+rna_dt = get_rna_dt(pbmc, goi)
+meta_dt = get_meta_dt(pbmc)
+rna_dt = merge(rna_dt, meta_dt[, .(id, orig.ident, meta_cluster)], by = "id")
+
+```
+
+Filter for genes that are in detected freqeuntly enough to reliably be
+analyzed.  
+
+* min_cells - minimum total number of cells in which counts are assigned to gene
+* min_fraction - minimum detection rate per cluster.  
+
+A gene is retained for analysis is either of these conditions are true. This 
+should be a good balance of general expression (min_cells) a cluster 
+specificity (min_fraction).
+
+```{r detection}
+min_cells = 500
+min_fraction = .2
+csize_dt = meta_dt[, .(size = .N), .(meta_cluster)]
+detect_dt = rna_dt[, .(detection_freq = sum(expression > 0)) , .(gene_name, meta_cluster)]
+detect_dt = merge(detect_dt, csize_dt, by = c("meta_cluster"))
+detect_dt[order(detection_freq)]
+detect_dt.by_clust = detect_dt
+kept_cluster_fraction = detect_dt.by_clust[, .(keep = (detection_freq / size) >= min_fraction), .(gene_name, meta_cluster)][keep == TRUE]$gene_name %>% unique
+
+detect_dt = detect_dt[, .(detection_freq = sum(detection_freq)), .(gene_name)]
+kept_total_detect = detect_dt[detection_freq >= min_cells]$gene_name
+
+kept = union(kept_total_detect, kept_cluster_fraction)
+message("keep ", length(kept), " of ", length(goi), " genes.")
+
+
+seqsetvis::ssvFeatureVenn(list(min_cell = kept_total_detect, clust_fraction = kept_cluster_fraction))
+```
+
+Run PCA, you can fiddle with n_dim to change the number of PCs used.
+
+```{r pca}
+n_dim = 30
+
+dat = pbmc@assays$RNA@data
+sel_dat = dat[goi,]
+sel_dat = sel_dat[kept,]
+
+layout(rbind(1:2))
+pca_res = prcomp((sel_dat))
+plot(pca_res$x[,1:2], main = "PC2 vs PC1")
+
+eigs <- pca_res$sdev^2
+eigs = eigs / sum(eigs)
+plot(cumsum(eigs), main = "Cumulative variance per PC")
+points(cumsum(eigs)[1:n_dim], col = "red")
+
+layout(1)
+```
+
+```{r tsne}
+#tsne hates duplicate values so we're gonna dedup and then undedupe
+pc = pca_res$x[, 1:n_dim]
+pca_dig = apply(pc, 1, digest::digest)
+cnt_dig = split(pca_dig, pca_dig) %>% lengths
+to_combine = cnt_dig[cnt_dig > 1] %>% names
+tk = pca_dig[pca_dig %in% names(cnt_dig[cnt_dig == 1])] %>% names
+
+pc.dedup = pc[tk,]
+for(tc in to_combine){
+    tc.genes = pca_dig[pca_dig == tc] %>% names
+    to_add = pc[tc.genes[1],, drop = FALSE]
+    
+    rownames(to_add) = paste(tc.genes, collapse = "_")
+    pc.dedup = rbind(pc.dedup, to_add)
+}
+
+tsne_res = Rtsne::Rtsne(pc.dedup, num_threads = 20)
+
+t_dt = as.data.table(tsne_res$Y)
+setnames(t_dt, c("tx", "ty"))
+t_dt$gene_name = pc.dedup %>% rownames
+
+if(any(grepl("_", t_dt$gene_name))){
+    t_dt = rbind(t_dt[!grepl("_", gene_name),], 
+                 t_dt[grepl("_", gene_name), .(tx, ty, gene_name = strsplit(gene_name, "_")[[1]])]
+    )    
+}
+stopifnot(t_dt$gene_name %in% goi)
+```
+
+```{r tsne bulk expression}
+t_dt = merge(t_dt, de_dt[, .(gene_name, log2FoldChange)], by = "gene_name")
+
+t_dt[, direction := ifelse(log2FoldChange > 0, "up", "down")]
+
+p_gene_tsne = ggplot(t_dt, aes(x = tx, y = ty, color = log2FoldChange, gene_name = gene_name)) + 
+    annotate("point", x = t_dt$tx, y = t_dt$ty, color = "gray60", size = .5) +
+    geom_point() +
+    scale_color_gradientn(colours = c("blue", "white", "red"), limits = c(-6, 6)) +
+    theme(panel.background = element_rect(fill = "gray30"), panel.grid = element_blank()) +
+    facet_wrap(~direction) +
+    labs(title = "gene tsne of scRNA captures patterns of bulk log2FC df/wt in naive")
+p_gene_tsne
+```
+
+```{r tsne detection}
+
+t_dt = merge(detect_dt, t_dt, by = "gene_name")
+p_gene_tsne.detection = ggplot(t_dt, aes(x = tx, y = ty, color = detection_freq, gene_name = gene_name)) + 
+    annotate("point", x = t_dt$tx, y = t_dt$ty, color = "gray60", size = .5) +
+    geom_point() +
+    # ggrepel::geom_text_repel(data = t_dt[detection_freq > 2000], aes(label = gene_name), color = "gray90") +
+    scale_color_viridis_c(limits = c(0, 2e3), na.value = "yellow") +
+    theme(panel.background = element_rect(fill = "gray30"), panel.grid = element_blank()) +
+    facet_wrap(~direction) +
+    labs(title = "apparent separation of DF4 down genes due to varying detection rate.\nnot pattern of expression.")
+p_gene_tsne.detection
+
+```
+
+Clustering is the hardest step here.  This is a quick/dumb solution.
+
+```{r set clusters}
+pc_plot = pc
+cap = 5
+pc_plot[pc_plot > cap] = cap
+pc_plot[pc_plot < -cap] = -cap
+
+t_mat = as.matrix(t_dt[, .(tx, ty)])
+rownames(t_mat) = t_dt$gene_name
+hres = gplots::heatmap.2(t_mat, trace = "n")
+hclust = cutree(as.hclust(hres$rowDendrogram), 5)
+clust_dt = data.table(gene_name = names(hclust), group = paste0("cluster_", hclust))
+clust_dt$group = factor(clust_dt$group)
+
+t_dt = merge(t_dt, clust_dt, by = "gene_name")
+
+p_gene_tsne.detection = ggplot(t_dt, aes(x = tx, y = ty, color = group, gene_name = gene_name)) + 
+    annotate("point", x = t_dt$tx, y = t_dt$ty, color = "gray60", size = .5) +
+    geom_point() +
+    # ggrepel::geom_text_repel(data = t_dt[detection_freq > 2000], aes(label = gene_name), color = "gray90") +
+    theme(panel.background = element_rect(fill = "gray30"), panel.grid = element_blank()) +
+    facet_wrap(~direction) +
+    labs(title = "apparent separation of DF4 down genes due to varying detection rate.\nnot pattern of expression.")
+p_gene_tsne.detection
+```
+
+
+```{r}
+mod_gl = split(t_dt$gene_name, t_dt$group)
+lengths(mod_gl)
+
+pmbc.mod = AddModuleScore(pbmc, mod_gl, name = names(mod_gl))
+
+mod_meta_dt = get_meta_dt(pmbc.mod, to_combine = get_clusters_to_combine())
+setnames(mod_meta_dt, paste0(names(mod_gl), seq_along(mod_gl)), names(mod_gl))
+
+
+plot_dt = mod_meta_dt[, c("seurat_clusters", "id", "orig.ident", "UMAP_1", "UMAP_2", names(mod_gl)), with = FALSE]
+plot_dt = melt(plot_dt, id.vars = c("seurat_clusters", "id", "orig.ident", "UMAP_1", "UMAP_2"), variable.name = "group", value.name = "module_score")
+plot_dt = plot_dt[order(module_score)]
+
+plots = lapply(unique(plot_dt$group), function(grp){
+    p = ggplot(plot_dt[group == grp], aes(x = UMAP_1, y = UMAP_2, color = module_score)) + 
+        scale_color_viridis_c(option = "magma") +
+        ggrastr::geom_point_rast(size = .3) +
+        facet_grid(group~orig.ident) +
+        theme(legend.position = "bottom",
+              axis.title = element_text(size = 8),
+              legend.title = element_text(size= 8),
+              strip.text = element_text(size = 8), 
+              panel.background = element_rect(fill = 'gray50'),
+              panel.grid = element_line(color = "gray60"),
+              panel.grid.minor = element_blank())
+    p    
+})
+plots
+```
